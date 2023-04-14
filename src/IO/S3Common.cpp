@@ -517,6 +517,7 @@ private:
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -524,6 +525,20 @@ namespace ErrorCodes
 
 namespace S3
 {
+    S3Exception::S3Exception(const Aws::S3::S3Error& s3_err, const String& extra_msg):
+        Exception(formatS3Error(s3_err, extra_msg), ErrorCodes::S3_ERROR),
+        error_type(s3_err.GetErrorType())
+    {
+    }
+
+    String S3Exception::formatS3Error(const Aws::S3::S3Error& err, const String& extra)
+    {
+        return fmt::format("Encounter exception when request s3, HTTP Code: {}, "
+            "RemoteHost: {}, RequestID: {}, ExceptionName: {}, ErrorMessage: {}, Extra: {}",
+            err.GetResponseCode(), err.GetRemoteHostIpAddress(), err.GetRequestId(),
+            err.GetExceptionName(), err.GetMessage(), extra);
+    }
+
     ClientFactory::ClientFactory()
     {
         aws_options = Aws::SDKOptions{};
@@ -665,6 +680,474 @@ namespace S3
         }
         else
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Bucket or key name are invalid in S3 URI: {}", uri.toString());
+    }
+
+    S3Config::S3Config(const String& ini_file_path)
+    {
+        namespace po = boost::program_options;
+        po::options_description s3_opts("s3_opts");
+
+        s3_opts.add_options()
+            ("s3.max_redirects", po::value<int>(&max_redirects)->default_value(10)->implicit_value(10), "max_redirects")
+            ("s3.connect_timeout_ms", po::value<int>(&connect_timeout_ms)->default_value(30000)->implicit_value(30000), "connect timeout ms")
+            ("s3.request_timeout_ms", po::value<int>(&request_timeout_ms)->default_value(30000)->implicit_value(30000), "request timeout ms")
+            ("s3.max_connections", po::value<int>(&max_connections)->default_value(200)->implicit_value(200), "max connections")
+            ("s3.region", po::value<String>(&region)->default_value("")->implicit_value(""), "region")
+            ("s3.endpoint", po::value<String>(&endpoint)->required(), "endpoint")
+            ("s3.bucket", po::value<String>(&bucket)->required(), "bucket")
+            ("s3.ak_id", po::value<String>(&ak_id)->required(), "ak id")
+            ("s3.ak_secret", po::value<String>(&ak_secret)->required(), "ak secret")
+            ("s3.root_prefix", po::value<String>(&root_prefix)->required(), "root prefix");
+
+        po::parsed_options opts = po::parse_config_file(ini_file_path.c_str(), s3_opts);
+        po::variables_map vm;
+        po::store(opts, vm);
+        po::notify(vm);
+
+        if (root_prefix.empty() || root_prefix[0] == '/')
+            throw Exception("Root prefix can't be empty or start with '/'",
+                ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    S3Config::S3Config(const Poco::Util::AbstractConfiguration& cfg,
+        const String& cfg_prefix)
+    {
+        max_redirects = cfg.getInt(cfg_prefix + ".max_redirects", 10);
+        connect_timeout_ms = cfg.getInt(cfg_prefix + ".connect_timeout_ms", 10000);
+        request_timeout_ms = cfg.getInt(cfg_prefix + ".request_timeout_ms", 30000);
+        max_connections = cfg.getInt(cfg_prefix + ".max_connections", 100);
+
+        region = cfg.getString(cfg_prefix + ".region", "us_east");
+
+        endpoint = cfg.getString(cfg_prefix + ".endpoint", "");
+        if (endpoint.empty())
+            throw Exception("Endpoint can't be empty, config prefix " + cfg_prefix,
+                ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
+        bucket = cfg.getString(cfg_prefix + ".bucket", "");
+        if (bucket.empty())
+            throw Exception("Bucket can't be empty, config prefix " + cfg_prefix,
+                ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
+        root_prefix = cfg.getString(cfg_prefix + ".path", "");
+        if (root_prefix.empty() || root_prefix[0] == '/')
+            throw Exception("Root prefix can't be empty or start with '/'",
+                ErrorCodes::BAD_ARGUMENTS);
+
+        // Not required, we can still obtain this from environment variable
+        ak_id = cfg.getString(cfg_prefix + ".ak_id", "");
+        ak_secret = cfg.getString(cfg_prefix + ".ak_secret", "");
+
+        collectCredentialsFromEnv();
+    }
+
+    void S3Config::collectCredentialsFromEnv()
+    {
+        static const char* S3_AK_ID = "AWS_ACCESS_KEY_ID";
+        static const char* S3_AK_SECRET = "AWS_SECRET_ACCESS_KEY";
+
+        char* env_ak_id = std::getenv(S3_AK_ID);
+        if (env_ak_id != nullptr && std::strlen(env_ak_id) != 0)
+        {
+            ak_id = String(env_ak_id);
+        }
+        char* env_ak_secret = std::getenv(S3_AK_SECRET);
+        if (env_ak_secret != nullptr && std::strlen(env_ak_secret) != 0)
+        {
+            ak_secret = String(env_ak_secret);
+        }
+    }
+
+    std::shared_ptr<Aws::S3::S3Client> S3Config::create() const {
+        PocoHTTPClientConfiguration client_cfg = S3::ClientFactory::instance().createClientConfiguration(
+            region, RemoteHostFilter(), max_redirects);
+        client_cfg.endpointOverride = endpoint;
+        client_cfg.region = region;
+        client_cfg.connectTimeoutMs = connect_timeout_ms;
+        client_cfg.requestTimeoutMs = request_timeout_ms;
+        client_cfg.maxConnections = max_connections;
+        client_cfg.enableTcpKeepAlive = true;
+
+        return S3::ClientFactory::instance().create(client_cfg, false,
+            ak_id, ak_secret, "", {}, false, false);
+    }
+
+
+}
+
+size_t S3Util::getObjectSize(const String& key) const
+{
+    return headObject(key).GetContentLength();
+}
+
+std::map<String, String> S3Util::getObjectMeta(const String& key) const
+{
+    return headObject(key).GetMetadata();
+}
+
+bool S3Util::exists(const String& key) const
+{
+    auto[more, _, names] = listObjectsWithPrefix(key, std::nullopt, 1);
+    return !names.empty() && names.front() == key;
+}
+
+bool S3Util::read(const String& key, size_t offset, size_t size,
+    BufferBase::Buffer& buffer) const
+{
+    if (size == 0)
+    {
+        buffer.resize(0);
+        return true;
+    }
+
+    String range = "bytes=" + std::to_string(offset) + "-" \
+        + std::to_string(offset + size - 1);
+
+    Aws::S3::Model::GetObjectRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetRange(range);
+
+    Aws::S3::Model::GetObjectOutcome outcome = client->GetObject(req);
+
+    if (outcome.IsSuccess())
+    {
+        // Set throw so we can get fail reason?
+        Aws::IOStream& stream = outcome.GetResult().GetBody();
+        stream.read(buffer.begin(), size);
+        size_t last_read_count = stream.gcount();
+        if (!last_read_count)
+        {
+            if (stream.eof())
+                return false;
+
+            if (stream.fail())
+                throw Exception("Cannot read from istream", ErrorCodes::S3_ERROR);
+
+            throw Exception("Unexpected state of istream", ErrorCodes::S3_ERROR);
+        }
+
+        buffer.resize(last_read_count);
+        return true;
+    }
+    else
+    {
+        // When we reach end of object
+        if (outcome.GetError().GetExceptionName() == "InvalidRange")
+        {
+            return false;
+        }
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+std::tuple<bool, String, std::vector<String>> S3Util::listObjectsWithPrefix(
+    const String& prefix, const std::optional<String>& token, int limit) const
+{
+    Aws::S3::Model::ListObjectsV2Request request;
+    request.SetBucket(bucket);
+    request.SetMaxKeys(limit);
+    request.SetPrefix(prefix);
+    if (token.has_value())
+    {
+        request.SetContinuationToken(token.value());
+    }
+
+    Aws::S3::Model::ListObjectsV2Outcome outcome = client->ListObjectsV2(request);
+
+    if (outcome.IsSuccess())
+    {
+        std::tuple<bool, String, std::vector<String>> result;
+        const Aws::Vector<Aws::S3::Model::Object>& contents = outcome.GetResult().GetContents();
+        std::get<0>(result) = outcome.GetResult().GetIsTruncated();
+        std::get<1>(result) = outcome.GetResult().GetNextContinuationToken();
+        std::get<2>(result).reserve(contents.size());
+        for (size_t i = 0; i < contents.size(); i++)
+        {
+            std::get<2>(result).push_back(contents[i].GetKey());
+        }
+        return result;
+    }
+    else
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+String S3Util::createMultipartUpload(const String& key,
+    const std::optional<std::map<String, String>>& meta,
+    const std::optional<std::map<String, String>>& tags) const
+{
+    Aws::S3::Model::CreateMultipartUploadRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    if (meta.has_value())
+    {
+        req.SetMetadata(meta.value());
+    }
+    if (tags.has_value())
+    {
+        req.SetTagging(urlEncodeMap(tags.value()));
+    }
+
+    auto outcome = client->CreateMultipartUpload(req);
+
+    if (outcome.IsSuccess())
+    {
+        return outcome.GetResult().GetUploadId();
+    }
+    else
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+void S3Util::completeMultipartUpload(const String& key, const String& upload_id,
+    const std::vector<String>& etags) const
+{
+    if (etags.empty())
+    {
+        throw Exception("Trying to complete a multiupload without any part in it",
+            ErrorCodes::LOGICAL_ERROR);
+    }
+
+    Aws::S3::Model::CompleteMultipartUploadRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetUploadId(upload_id);
+
+    Aws::S3::Model::CompletedMultipartUpload multipart_upload;
+    for (size_t i = 0; i < etags.size(); ++i)
+    {
+        Aws::S3::Model::CompletedPart part;
+        multipart_upload.AddParts(part.WithETag(etags[i]).WithPartNumber(i + 1));
+    }
+
+    req.SetMultipartUpload(multipart_upload);
+
+    auto outcome = client->CompleteMultipartUpload(req);
+
+    if (!outcome.IsSuccess())
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+void S3Util::abortMultipartUpload(const String& key, const String& upload_id) const
+{
+    Aws::S3::Model::AbortMultipartUploadRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetUploadId(upload_id);
+
+    auto outcome = client->AbortMultipartUpload(req);
+
+    if (!outcome.IsSuccess())
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+String S3Util::uploadPart(const String& key, const String& upload_id,
+    size_t part_number, size_t size, const std::shared_ptr<Aws::StringStream>& stream) const
+{
+    Aws::S3::Model::UploadPartRequest req;
+
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetPartNumber(part_number);
+    req.SetUploadId(upload_id);
+    req.SetContentLength(size);
+    req.SetBody(stream);
+
+    auto outcome = client->UploadPart(req);
+
+    if (outcome.IsSuccess())
+    {
+        return outcome.GetResult().GetETag();
+    }
+    else
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+void S3Util::upload(const String& key, size_t size, const std::shared_ptr<Aws::StringStream>& stream,
+    const std::optional<std::map<String, String>>& metadata,
+    const std::optional<std::map<String, String>>& tags) const
+{
+    Aws::S3::Model::PutObjectRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetContentLength(size);
+    req.SetBody(stream);
+    if (metadata.has_value())
+    {
+        req.SetMetadata(metadata.value());
+    }
+    if (tags.has_value())
+    {
+        req.SetTagging(urlEncodeMap(tags.value()));
+    }
+
+    auto outcome = client->PutObject(req);
+
+    if (!outcome.IsSuccess())
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+void S3Util::deleteObject(const String& key, bool check_existence) const
+{
+    if (check_existence)
+    {
+        getObjectSize(key);
+    }
+
+    Aws::S3::Model::DeleteObjectRequest request;
+    request.SetBucket(bucket);
+    request.SetKey(key);
+
+    Aws::S3::Model::DeleteObjectOutcome outcome = client->DeleteObject(request);
+
+    if (!outcome.IsSuccess())
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+void S3Util::deleteObjects(const std::vector<String>& keys) const
+{
+    if (keys.empty())
+    {
+        return;
+    }
+
+    std::vector<Aws::S3::Model::ObjectIdentifier> obj_ids;
+    obj_ids.reserve(keys.size());
+    for (const String& key : keys)
+    {
+        Aws::S3::Model::ObjectIdentifier obj_id;
+        obj_id.SetKey(key);
+        obj_ids.push_back(obj_id);
+    }
+    Aws::S3::Model::Delete delete_objs;
+    delete_objs.SetObjects(obj_ids);
+    delete_objs.SetQuiet(true);
+
+    Aws::S3::Model::DeleteObjectsRequest request;
+    request.SetBucket(bucket);
+    request.SetDelete(delete_objs);
+
+    Aws::S3::Model::DeleteObjectsOutcome outcome = client->DeleteObjects(request);
+
+    if (!outcome.IsSuccess())
+    {
+        throw S3Exception(outcome.GetError());
+    }
+    else
+    {
+        auto str_err = [](const std::vector<Aws::S3::Model::Error>& errs) {
+            std::stringstream ss;
+            for (size_t i = 0; i < errs.size(); i++)
+            {
+                auto& err = errs[i];
+                ss << "{" << err.GetKey() << ": " << err.GetMessage() << "}";
+            }
+            return ss.str();
+        };
+        const std::vector<Aws::S3::Model::Error>& errs = outcome.GetResult().GetErrors();
+        if (!errs.empty())
+        {
+            throw S3Exception(outcome.GetError(), str_err(errs));
+        }
+    }
+}
+
+void S3Util::deleteObjectsInBatch(const std::vector<String>& keys, size_t batch_size) const
+{
+    for (size_t idx = 0; idx < keys.size(); idx += batch_size)
+    {
+        size_t end_idx = std::min(idx + batch_size, keys.size());
+        deleteObjects(std::vector<String>(keys.begin() + idx, keys.begin() + end_idx));
+    }
+}
+
+void S3Util::deleteObjectsWithPrefix(const String& prefix,
+    const std::function<bool(const S3Util&, const String&)>& filter, size_t batch_size) const
+{
+    bool more = false;
+    std::optional<String> token = std::nullopt;
+    std::vector<String> object_names;
+    std::vector<String> objects_to_clean;
+
+    do {
+        object_names.clear();
+
+        std::tie(more, token, object_names) = listObjectsWithPrefix(prefix, token, batch_size);
+
+        for (const String& name : object_names)
+        {
+            if (filter(*this, name))
+            {
+                objects_to_clean.push_back(name);
+
+                if (objects_to_clean.size() > batch_size)
+                {
+                    deleteObjects(objects_to_clean);
+                    objects_to_clean.clear();
+                }
+            }
+        }
+    } while(more);
+
+    deleteObjects(objects_to_clean);
+}
+
+String S3Util::urlEncodeMap(const std::map<String, String>& mp)
+{
+    Poco::URI uri;
+    for (const auto& entry : mp)
+    {
+        uri.addQueryParameter(fmt::format("{}:{}", entry.first, entry.second));
+    }
+    return uri.getQuery();
+}
+
+// Since head object has no http response body, but it won't possible to
+// get actual error message if something goes wrong
+Aws::S3::Model::HeadObjectResult S3Util::headObject(const String& key) const
+{
+    Aws::S3::Model::HeadObjectRequest request;
+    request.SetBucket(bucket);
+    request.SetKey(key);
+
+    Aws::S3::Model::HeadObjectOutcome outcome = client->HeadObject(request);
+    if (outcome.IsSuccess())
+    {
+        return outcome.GetResultWithOwnership();
+    }
+    else
+    {
+        throw S3Exception(outcome.GetError());
+    }
+}
+
+Aws::S3::Model::GetObjectResult S3Util::headObjectByGet(const String& key) const
+{
+    Aws::S3::Model::GetObjectRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(key);
+    req.SetRange("bytes=0-1");
+
+    Aws::S3::Model::GetObjectOutcome outcome = client->GetObject(req);
+
+    if (outcome.IsSuccess())
+    {
+        return outcome.GetResultWithOwnership();
+    }
+    else
+    {
+        throw S3Exception(outcome.GetError());
     }
 }
 

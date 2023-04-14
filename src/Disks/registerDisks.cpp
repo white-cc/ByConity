@@ -35,6 +35,7 @@ void registerDiskMemory(DiskFactory & factory);
 
 #if USE_AWS_S3
 void registerDiskS3(DiskFactory & factory);
+void registerDisksByteS3(DiskFactory& factory);
 #endif
 
 #if USE_HDFS
