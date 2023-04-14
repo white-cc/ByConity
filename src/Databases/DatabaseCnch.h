@@ -83,7 +83,7 @@ public:
 protected:
     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr local_context, bool throw_on_error) const override;
     StoragePtr tryGetTableImpl(const String & name, ContextPtr local_context) const;
-
+    void emplaceStorageTypeInTableDef(ASTCreateQuery& ast, const StoragePtr& storage);
 private:
     const UUID db_uuid;
     /// local storage cache, mapping from name->storage, mainly for select query

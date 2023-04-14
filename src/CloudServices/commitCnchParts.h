@@ -15,9 +15,11 @@
 
 #pragma once
 
+#include <memory>
 #include <Storages/MergeTree/DeleteBitmapMeta.h>
 #include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
 #include <Transaction/TxnTimestamp.h>
+#include <Transaction/Actions/S3AttachMetaAction.h>
 #include <WorkerTasks/ManipulationType.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
 
@@ -46,7 +48,8 @@ public:
         ManipulationType type_,
         String task_id_ = {},
         String consumer_group_ = {},
-        const cppkafka::TopicPartitionList & tpl_ = {});
+        const cppkafka::TopicPartitionList & tpl_ = {},
+        std::shared_ptr<S3AttachPartsInfo> s3_part_info_ = nullptr);
 
     ~CnchDataWriter() = default;
 
@@ -79,6 +82,9 @@ private:
 
     String consumer_group;
     cppkafka::TopicPartitionList tpl;
+    std::shared_ptr<S3AttachPartsInfo> s3_part_info;
+
+    UUID newPartID(const MergeTreePartInfo& part_info, UInt64 txn_timestamp);
 };
 
 }

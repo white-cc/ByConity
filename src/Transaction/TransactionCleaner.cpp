@@ -15,6 +15,7 @@
 
 #include <Transaction/TransactionCleaner.h>
 
+#include <Disks/DiskByteS3.h>
 #include <Catalog/Catalog.h>
 #include <Common/serverLocality.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
@@ -23,6 +24,9 @@
 #include <Transaction/TransactionCoordinatorRcCnch.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Transaction/TransactionCommon.h>
+#include <Transaction/Actions/S3AttachMetaFileAction.h>
+#include <Transaction/Actions/S3AttachMetaAction.h>
+#include <Transaction/Actions/S3DetachMetaAction.h>
 
 namespace DB
 {
@@ -113,6 +117,16 @@ void TransactionCleaner::cleanCommittedTxn(const TransactionRecord & txn_record)
                 continue;
 
             UndoResourceNames names = integrateResources(resources);
+
+            /// Collect extra parts to update commit time
+            /// We don't want to add it into integrateResources since when clean aborted
+            /// transaction, we need some extra logic rather than just delete it from catalog
+            S3AttachMetaAction::collectUndoResourcesForCommit(resources, names.parts);
+            /// Clean detach parts for s3 committed
+            S3DetachMetaAction::commitByUndoBuffer(context, table, resources);
+            /// Clean s3 meta file
+            S3AttachMetaFileAction::commitByUndoBuffer(context, resources);
+
             auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);
             auto undo_bitmaps = catalog->getDeleteBitmapByKeys(table, names.bitmaps);
             auto staged_parts = catalog->getStagedDataPartsByNames(names.staged_parts, table, 0);
@@ -176,6 +190,11 @@ void TransactionCleaner::cleanAbortedTxn(const TransactionRecord & txn_record)
             auto * storage = dynamic_cast<MergeTreeMetaBase *>(table.get());
             if (!storage)
                 throw Exception("Table is not of MergeTree class", ErrorCodes::LOGICAL_ERROR);
+
+            // Clean attach parts for s3 aborted
+            S3AttachMetaAction::abortByUndoBuffer(context, table, resources);
+            // Clean detach parts for s3 aborted
+            S3DetachMetaAction::abortByUndoBuffer(context, table, resources);
 
             UndoResourceNames names = integrateResources(resources);
             auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);

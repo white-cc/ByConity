@@ -27,6 +27,7 @@
 #include <Common/LRUCache.h>
 #include <Common/Stopwatch.h>
 #include <Common/escapeForFileName.h>
+#include "IO/ReadBufferFromFileBase.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -34,6 +35,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <filesystem>
+#include <memory>
 
 
 namespace DB
@@ -192,20 +195,12 @@ int KeyIndexFileCache::get(const IndexFile::RemoteFileInfo & file)
                     LOG_WARNING(&Poco::Logger::get("KeyIndexFileCache"), "KeyIndexFileCache has been destory.");
                     return;
                 }
+                String abs_path = std::filesystem::path(file.disk->getPath()) / file.rel_path;
                 try
-                {
-                    Context & context = rep_inner->context;
-                    ReadBufferFromByteHDFS remote_buf(
-                        file.path,
-                        true,
-                        context.getHdfsConnectionParams(),
-                        DBMS_DEFAULT_BUFFER_SIZE,
-                        nullptr,
-                        0,
-                        false,
-                        context.getDiskCacheThrottler());
-                    remote_buf.seek(file.start_offset);
-                    LimitReadBuffer from(remote_buf, file.size, false);
+                {   
+                    std::unique_ptr<ReadBufferFromFileBase> remote_buf = file.disk->readFile(file.rel_path);
+                    remote_buf->seek(file.start_offset);
+                    LimitReadBuffer from(*remote_buf, file.size, false);
 
                     /// download into tmp file
                     String tmp_file = rep_inner->base_path + "TMP_" + escapeForFileName(file.cache_key);
@@ -225,7 +220,7 @@ int KeyIndexFileCache::get(const IndexFile::RemoteFileInfo & file)
                     LOG_ERROR(
                         &Poco::Logger::get("KeyIndexFileCache"),
                         "Failed to cache {} to local disks: {}",
-                        file.path,
+                        abs_path,
                         getCurrentExceptionMessage(false));
                     rep_inner->cache.remove(file.cache_key);
                 }

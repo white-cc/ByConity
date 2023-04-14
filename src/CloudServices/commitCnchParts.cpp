@@ -21,15 +21,23 @@
 #include <Interpreters/PartLog.h>
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 #include <Storages/MergeTree/MergeTreeCNCHDataDumper.h>
+#include <Storages/MergeTree/S3PartsAttachMeta.h>
 #include <Transaction/Actions/DDLAlterAction.h>
 #include <Transaction/Actions/DropRangeAction.h>
 #include <Transaction/Actions/InsertAction.h>
 #include <Transaction/Actions/MergeMutateAction.h>
+#include <Transaction/Actions/S3AttachMetaAction.h>
+#include <Transaction/Actions/S3DetachMetaAction.h>
 #include <Transaction/TransactionCommon.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
 #include <Transaction/CnchWorkerTransaction.h>
 #include <Transaction/TxnTimestamp.h>
-#include "Disks/IDisk.h"
+#include <Disks/DiskType.h>
+#include <Disks/IDisk.h>
+#include <Disks/IVolume.h>
+#include <WorkerTasks/ManipulationType.h>
+#include <Core/Types.h>
+#include <Core/UUID.h>
 
 namespace DB
 {
@@ -49,13 +57,15 @@ CnchDataWriter::CnchDataWriter(
     ManipulationType type_,
     String task_id_,
     String consumer_group_,
-    const cppkafka::TopicPartitionList & tpl_)
+    const cppkafka::TopicPartitionList & tpl_,
+    std::shared_ptr<S3AttachPartsInfo> s3_part_info_)
     : storage(storage_)
     , context(context_)
     , type(type_)
     , task_id(std::move(task_id_))
     , consumer_group(std::move(consumer_group_))
     , tpl(tpl_)
+    , s3_part_info(s3_part_info_)
 {
 }
 
@@ -123,7 +133,6 @@ DumpedData CnchDataWriter::dumpCnchParts(
     }
 
     auto txn_id = curr_txn->getTransactionID();
-
     /// Write undo buffer first before dump to vfs
     std::vector<UndoResource> undo_resources;
     undo_resources.reserve(temp_parts.size() + temp_bitmaps.size() + temp_staged_parts.size());
@@ -136,7 +145,16 @@ DumpedData CnchDataWriter::dumpCnchParts(
     {
         String part_name = part->info.getPartNameWithHintMutation();
         auto disk = storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
-        undo_resources.emplace_back(txn_id, UndoResourceType::Part, part_name, part_name + '/');
+        // Assign part id here, since we need to record it into undo buffer before dump part to filesystem
+        String relative_path = part_name;
+        if ( disk->getType() == DiskType::ByteS3)
+        {
+            UUID part_id = newPartID(part->info, txn_id.toUInt64());
+            part->part_id = part_id;
+            relative_path = UUIDHelpers::UUIDToString(part_id);
+        }
+
+        undo_resources.emplace_back(txn_id, UndoResourceType::Part, part_name, relative_path + '/');
         undo_resources.back().setDiskName(disk->getName());
         part_disks.emplace_back(std::move(disk));
     }
@@ -148,6 +166,15 @@ DumpedData CnchDataWriter::dumpCnchParts(
     {
         String part_name = staged_part->info.getPartNameWithHintMutation();
         auto disk = storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
+        // Assign part id here, since we need to record it into undo buffer before dump part to filesystem
+        String relative_path = part_name;
+        if ( disk->getType() == DiskType::ByteS3)
+        {
+            UUID part_id = newPartID(part->info, txn_id.toUInt64());
+            part->part_id = part_id;
+            relative_path = UUIDHelpers::UUIDToString(part_id);
+        }
+
         undo_resources.emplace_back(txn_id, UndoResourceType::StagedPart, part_name, part_name + '/');
         undo_resources.back().setDiskName(disk->getName());
         part_disks.emplace_back(std::move(disk));
@@ -166,7 +193,9 @@ DumpedData CnchDataWriter::dumpCnchParts(
 
     /// Parallel dumping to shared storage
     DumpedData result;
-    MergeTreeCNCHDataDumper dumper(storage);
+    S3ObjectMetadata::PartGeneratorID part_generator_id(S3ObjectMetadata::PartGeneratorID::TRANSACTION,
+        curr_txn->getTransactionID().toString());
+    MergeTreeCNCHDataDumper dumper(storage, part_generator_id);
 
     watch.restart();
     ThreadPool dump_pool(std::min(
@@ -412,6 +441,18 @@ TxnTimestamp CnchDataWriter::commitPreparedCnchParts(const DumpedData & dumped_d
                 });
             }
         }
+        else if (type == ManipulationType::Attach)
+        {
+            if (s3_parts_info == nullptr || s3_parts_info->parts.empty())
+            {
+                LOG_INFO(storage.getLogger(), "Nothing to commit, skip");
+                return;
+            }
+
+            auto action = txn->createAction<S3AttachMetaAction>(storage_ptr, *s3_parts_info);
+            txn->appendAction(action);
+            action->executeV2();
+        }
         else
         {
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Not support commit type {}", typeToString(type));
@@ -481,6 +522,19 @@ void CnchDataWriter::publishStagedParts(
     items.bitmaps = dumpDeleteBitmaps(storage, bitmaps_to_dump);
 
     commitDumpedParts(items);
+}
+
+UUID newPartID(const MergeTreePartInfo& part_info, UInt64 txn_timestamp)
+{
+    UUID random_id = UUIDHelpers::generateV4();
+
+    UInt64& random_id_low = random_id.toUnderType().low;
+    UInt64& random_id_high = random_id.toUnderType().high;
+    boost::hash_combine(random_id_low, part_info.min_block);
+    boost::hash_combine(random_id_high, part_info.max_block);
+    boost::hash_combine(random_id_low, part_info.mutation);
+    boost::hash_combine(random_id_high, txn_timestamp);
+    return random_id;
 }
 
 }

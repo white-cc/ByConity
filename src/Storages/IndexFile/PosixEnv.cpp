@@ -7,10 +7,10 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Storages/HDFS/ReadBufferFromByteHDFS.h>
 #include <Storages/IndexFile/Env.h>
 #include <Common/Exception.h>
 #include <Common/Slice.h>
+#include <IO/ReadSettings.h>
 
 #include <assert.h>
 #include <limits>
@@ -91,37 +91,34 @@ namespace
             if (fd < 0)
             {
                 /// fallback to remote read
+                String abs_path = file.disk->getPath() + file.rel_path;
                 try
-                {
-                    ReadBufferFromByteHDFS buffer(
-                        file.path,
-                        /*pread=*/true,
-                        file.hdfs_params,
-                        /*buf_size=*/n,
-                        /*existing_memory=*/scratch,
-                        /*alignment=*/0,
-                        /*read_all_once=*/true);
+                {   
+                    ReadSettings read_settings;
+                    read_settings.buffer_size = 0; 
+                    std::unique_ptr<ReadBufferFromFileBase> buffer = file.disk->readFile(file.rel_path, read_settings);
 
                     auto seek_off = static_cast<off_t>(file.start_offset + offset);
-                    auto res_off = buffer.seek(seek_off);
+                    auto res_off = buffer->seek(seek_off);
                     if (res_off != seek_off)
                         throw Exception(
-                            "Seek to " + file.path + " should return " + toString(seek_off) + " but got " + toString(res_off),
+                            "Seek to " + abs_path + " should return " + toString(seek_off) + " but got " + toString(res_off),
                             ErrorCodes::LOGICAL_ERROR);
 
-                    auto is_eof = buffer.eof(); /// will trigger reading into scratch
+                    auto is_eof = buffer->eof();
                     if (is_eof)
                         throw Exception(
-                            "Unexpected EOF when reading " + file.path + ", off=" + toString(seek_off) + ", size=" + toString(n),
+                            "Unexpected EOF when reading " + file.rel_path + ", off=" + toString(seek_off) + ", size=" + toString(n),
                             ErrorCodes::LOGICAL_ERROR);
-                    assert(buffer.buffer().size() == n);
-
+                    assert(buffer->buffer().size() == n);
+                    memcpy(scratch, buffer->buffer().begin(), buffer->buffer().size());
+                    
                     *result = Slice(scratch, n);
                 }
                 catch (...)
                 {
                     *result = Slice(scratch, 0);
-                    s = Status::IOError(file.path, getCurrentExceptionMessage(false));
+                    s = Status::IOError(abs_path, getCurrentExceptionMessage(false));
                 }
             }
             else

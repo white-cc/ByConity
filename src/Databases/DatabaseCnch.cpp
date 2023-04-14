@@ -14,12 +14,14 @@
  */
 
 #include <mutex>
+#include <memory>
 #include <Databases/DatabaseCnch.h>
 
 #include <Catalog/Catalog.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTSetQuery.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/formatAST.h>
 #include <Parsers/parseQuery.h>
@@ -397,6 +399,46 @@ void DatabaseCnch::renameTable(
     std::lock_guard wr{cache_mutex};
     if (cache.contains(table_name))
         cache.erase(table_name);
+}
+
+void DatabaseCnch::emplaceStorageTypeInTableDef(ASTCreateQuery& create, const StoragePtr& storage)
+{
+    auto emplace_merge_tree_settings = [](ASTCreateQuery& ast, const String& key,
+            const String& value) {
+        if (value.empty())
+        {
+            return;
+        }
+
+        if (ast.storage == nullptr)
+        {
+            ast.set(ast.storage, std::make_shared<ASTStorage>());
+        }
+        if (ast.storage->settings == nullptr)
+        {
+            ast.storage->set(ast.storage->settings, std::make_shared<ASTSetQuery>());
+        }
+        auto& changes = ast.storage->settings->changes;
+        for (const SettingChange& change : changes)
+        {
+            if (change.name == key)
+            {
+                return;
+            }
+        }
+        changes.emplace_back(key, value);
+    };
+    auto get_table_storage_type = [](const StoragePtr& storage) {
+        std::shared_ptr<const MergeTreeMetaBase> tbl = std::dynamic_pointer_cast<const MergeTreeMetaBase>(storage);
+        if (tbl != nullptr)
+        {
+            return DiskType::Type(tbl->getStoragePolicy(IStorage::StorageLocation::MAi).getRemoteVolumeType());
+        }
+        return String();
+    };
+
+    emplace_merge_tree_settings(create, "remote_storage_type",
+        get_table_storage_type(storage));
 }
 
 }
