@@ -392,7 +392,7 @@ void MergedReadBufferWithSegmentCache::initSourceBufferIfNeeded()
                     .mmap_cache = settings.mmap_cache.get()
                 });
             },
-            uncompressed_cache, false, source_data_offset, source_data_size, true
+            uncompressed_cache, false, source_data_offset, source_data_size
         );
 
         source_buffer.initialize(std::move(cached_compressed_buffer), nullptr);
@@ -407,7 +407,7 @@ void MergedReadBufferWithSegmentCache::initSourceBufferIfNeeded()
                 .mmap_threshold = settings.min_bytes_to_use_mmap_io,
                 .mmap_cache = settings.mmap_cache.get()
             }),
-            false, source_data_offset, source_data_size, true
+            false, source_data_offset, source_data_size
         );
 
         source_buffer.initialize(nullptr, std::move(non_cached_compressed_buffer));

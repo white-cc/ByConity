@@ -123,8 +123,7 @@ MergeTreeReaderStream::MergeTreeReaderStream(
             uncompressed_cache,
             /* allow_different_codecs = */false,
             data_file_offset,
-            data_file_size_,
-            /* is_limit = */true);
+            data_file_size_);
 
         if (profile_callback)
             buffer->setProfileCallback(profile_callback, clock_type);
@@ -150,8 +149,7 @@ MergeTreeReaderStream::MergeTreeReaderStream(
             ),
             /* allow_different_codecs = */false,
             data_file_offset,
-            data_file_size_,
-            /* is_limit = */true);
+            data_file_size_);
 
         if (profile_callback)
             buffer->setProfileCallback(profile_callback, clock_type);

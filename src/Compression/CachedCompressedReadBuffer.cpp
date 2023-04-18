@@ -35,35 +35,32 @@ namespace ErrorCodes
     extern const int SEEK_POSITION_OUT_OF_BOUND;
 }
 
-
 void CachedCompressedReadBuffer::initInput()
 {
-    if (!file_in)
+    if (limit_reader == nullptr)
     {
-        file_in = file_in_creator();
-        compressed_in = file_in.get();
+        raw_reader = reader_creator();
+        limit_reader = std::make_unique<LimitSeekableReadBuffer>(*raw_reader,
+            begin_offset, end_offset);
+
+        compressed_in = limit_reader.get();
 
         if (profile_callback)
-            file_in->setProfileCallback(profile_callback, clock_type);
+        {
+            raw_reader->setProfileCallback(profile_callback, clock_type);
+        }
     }
 }
 
-
 bool CachedCompressedReadBuffer::nextImpl()
 {
-
-    /// It represents the end of file when the position exceeds the limit in hdfs shared storage or handling implicit column data in compact impl.
-    /// TODO: handle hdfs case
-    if (/*(storage_type == StorageType::Hdfs || */is_limit /*)*/ && file_pos >= limit_offset_in_file)
-        return false;
-
     /// Let's check for the presence of a decompressed block in the cache, grab the ownership of this block, if it exists.
     UInt128 key = cache->hash(path, file_pos);
 
-    owned_cell = cache->getOrSet(key, [&]()
-    {
+    owned_cell = cache->getOrSet(key, [&]() {
         initInput();
-        file_in->seek(file_pos, SEEK_SET);
+
+        raw_reader->seek(file_pos, SEEK_SET);
 
         auto cell = std::make_shared<UncompressedCacheCell>();
 
@@ -92,20 +89,12 @@ bool CachedCompressedReadBuffer::nextImpl()
 }
 
 CachedCompressedReadBuffer::CachedCompressedReadBuffer(
-    const std::string & path_,
-    std::function<std::unique_ptr<ReadBufferFromFileBase>()> file_in_creator_,
-    UncompressedCache * cache_,
-    bool allow_different_codecs_,
-    off_t file_offset_,
-    size_t file_size_,
-    bool is_limit_)
-    : ReadBuffer(nullptr, 0)
-    , file_in_creator(std::move(file_in_creator_))
-    , cache(cache_)
-    , path(path_)
-    , file_pos(file_offset_)
-    , limit_offset_in_file(file_offset_ + file_size_)
-    , is_limit(is_limit_)
+    const std::string& path_, std::function<std::unique_ptr<ReadBufferFromFileBase>()> reader_creator_,
+    UncompressedCache* cache_, bool allow_different_codecs_, off_t begin_offset_,
+    std::optional<size_t> end_offset_):
+        ReadBuffer(nullptr, 0), path(path_), begin_offset(begin_offset_),
+        end_offset(end_offset_), cache(cache_), reader_creator(std::move(reader_creator_)),
+        raw_reader(nullptr), limit_reader(nullptr), file_pos(0), owned_cell(nullptr)
 {
     allow_different_codecs = allow_different_codecs_;
 }

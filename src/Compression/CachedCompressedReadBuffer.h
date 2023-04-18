@@ -24,9 +24,9 @@
 #include <memory>
 #include <time.h>
 #include <IO/ReadBufferFromFileBase.h>
-#include "CompressedReadBufferBase.h"
 #include <IO/UncompressedCache.h>
-
+#include <IO/LimitSeekableReadBuffer.h>
+#include <Compression/CompressedReadBufferBase.h>
 
 namespace DB
 {
@@ -41,20 +41,16 @@ namespace DB
 class CachedCompressedReadBuffer : public CompressedReadBufferBase, public ReadBuffer
 {
 private:
-    std::function<std::unique_ptr<ReadBufferFromFileBase>()> file_in_creator;
-    UncompressedCache * cache;
-    std::unique_ptr<ReadBufferFromFileBase> file_in;
-
     const std::string path;
-    //size_t file_pos;
-    off_t file_pos;
-    /// It represents the end of file in local storage. but in remote storage(e.g. hdfs),
-    /// We merge some small file to a big data file, so it represents the end pos of small file in one big data file.
-    const off_t limit_offset_in_file;
+    size_t begin_offset;
+    std::optional<size_t> end_offset;
+    UncompressedCache * cache;
+    std::function<std::unique_ptr<ReadBufferFromFileBase>()> reader_creator;
 
-    /// The parameter marks whether to read range in the data file.
-    /// In compact map data, all implicit columns are stored in the same file. So when reading one implicit column data, it will be a range, which is [offset, offset + implicit col file size]. In this case, this parameter is true.
-    bool is_limit = false;
+    std::unique_ptr<ReadBufferFromFileBase> raw_reader;
+    std::unique_ptr<LimitSeekableReadBuffer> limit_reader;
+
+    size_t file_pos;
 
     /// A piece of data from the cache, or a piece of read data that we put into the cache.
     UncompressedCache::MappedPtr owned_cell;
@@ -68,13 +64,9 @@ private:
 
 public:
     CachedCompressedReadBuffer(
-        const std::string & path,
-        std::function<std::unique_ptr<ReadBufferFromFileBase>()> file_in_creator,
-        UncompressedCache * cache_,
-        bool allow_different_codecs_ = false,
-        off_t file_offset_ = 0,
-        size_t file_size_ = 0,
-        bool is_limit_ = false);
+        const std::string& path_, std::function<std::unique_ptr<ReadBufferFromFileBase>()> reader_creator_,
+        UncompressedCache* cache_, bool allow_different_codecs_ = false,
+        off_t begin_offset_ = 0, std::optional<size_t> end_offset_ = std::nullopt);
 
     void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block);
 

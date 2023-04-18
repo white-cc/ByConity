@@ -22,6 +22,7 @@
 #pragma once
 
 #include "CompressedReadBufferBase.h"
+#include <IO/LimitSeekableReadBuffer.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <time.h>
 #include <memory>
@@ -44,34 +45,22 @@ private:
       *  - `file_in` points to the end of this block.
       *  - `size_compressed` contains the compressed size of this block.
       */
-    std::unique_ptr<ReadBufferFromFileBase> p_file_in;
-    ReadBufferFromFileBase & file_in;
+    std::unique_ptr<ReadBufferFromFileBase> raw_reader;
+    LimitSeekableReadBuffer limit_reader;
     size_t size_compressed = 0;
-
-    const off_t limit_offset_in_file;
-    bool is_limit = false;
 
     bool nextImpl() override;
 
 public:
-    CompressedReadBufferFromFile(
-        std::unique_ptr<ReadBufferFromFileBase> buf,
-        bool allow_different_codecs_ = false,
-        off_t file_offset_ = 0,
-        size_t file_size_ = 0,
-        bool is_limit_ = false);
+    explicit CompressedReadBufferFromFile(
+        std::unique_ptr<ReadBufferFromFileBase> buf_, bool allow_different_codecs_ = false,
+        off_t begin_offset_ = 0, std::optional<size_t> end_offset_ = std::nullopt);
 
     CompressedReadBufferFromFile(
-        const std::string & path,
-        size_t estimated_size,
-        size_t aio_threshold,
-        size_t mmap_threshold,
-        MMappedFileCache * mmap_cache,
-        size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
-        bool allow_different_codecs_ = false,
-        off_t file_offset_ = 0,
-        size_t file_size_ = 0,
-        bool is_limit_ = false);
+        const std::string& path_, size_t estimated_size_, size_t aio_threshold_,
+        size_t mmap_threshold_, MMappedFileCache* mmap_cache_, size_t buf_size_ = DBMS_DEFAULT_BUFFER_SIZE,
+        bool allow_different_codecs_ = false, off_t begin_offset_ = 0,
+        std::optional<size_t> end_offset_ = std::nullopt);
 
     void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block);
 
@@ -79,19 +68,19 @@ public:
 
     void setProfileCallback(const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_ = CLOCK_MONOTONIC_COARSE)
     {
-        file_in.setProfileCallback(profile_callback_, clock_type_);
+        raw_reader->setProfileCallback(profile_callback_, clock_type_);
     }
 
     String getPath() const
     {
-        return file_in.getFileName();
+        return raw_reader->getFileName();
     }
 
     size_t getSizeCompressed() const { return size_compressed; }
 
     size_t compressedOffset() const
     {
-        return file_in.getPosition();
+        return raw_reader->getPosition();
     }
 };
 
