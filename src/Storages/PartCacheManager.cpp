@@ -502,6 +502,26 @@ void PartCacheManager::invalidPartCacheWithoutLock(const UUID & uuid, std::uniqu
     part_cache_ptr->dropCache(uuid);
 }
 
+void PartCacheManager::invalidPartCache(const UUID & uuid, const TableMetaEntryPtr & meta_ptr, const std::unordered_map<String, Strings> & partition_to_parts)
+{
+    auto lock = meta_ptr->writeLock();
+
+    for (auto it = partition_to_parts.begin(); it != partition_to_parts.end(); it++)
+    {
+        auto cached = part_cache_ptr->get({uuid, it->first});
+
+        for (auto & part_name : it->second)
+        {
+            if (cached)
+            {
+                auto got = cached->find(part_name);
+                if (got != cached->end())
+                    cached->erase(got);
+            }
+        }
+    }
+}
+
 void PartCacheManager::invalidPartCache(const UUID & uuid, const DataPartsVector & parts)
 {
     TableMetaEntryPtr meta_ptr = getTableMeta(uuid);
@@ -511,6 +531,8 @@ void PartCacheManager::invalidPartCache(const UUID & uuid, const DataPartsVector
 
     std::unordered_map<String, Names> partition_to_parts;
     Strings partition_ids;
+    /// TODO: optimized the lock here.
+    std::unordered_map<String, Strings> partition_to_parts;
     for (auto & part : parts)
     {
         const String & partition_id = part->info.partition_id;
@@ -522,10 +544,13 @@ void PartCacheManager::invalidPartCache(const UUID & uuid, const DataPartsVector
         else
         {
             Names part_list{part->name};
+            Strings part_list{part->name};
             partition_to_parts.emplace(partition_id, part_list);
             partition_ids.push_back(partition_id);
         }
     }
+    invalidPartCache(uuid, meta_ptr, partition_to_parts);
+}
 
     auto meta_partitions = meta_ptr->getPartitions(partition_ids);
 
@@ -536,14 +561,30 @@ void PartCacheManager::invalidPartCache(const UUID & uuid, const DataPartsVector
             continue;
         auto partition_write_lock = meta_it->second->writeLock();
         auto cached = part_cache_ptr->get({uuid, it->first});
+void PartCacheManager::invalidPartCache(const UUID & uuid, const Strings & part_names, MergeTreeDataFormatVersion version)
+{
+    TableMetaEntryPtr meta_ptr = getTableMeta(uuid);
 
-        if (cached)
+    if (!meta_ptr)
+        return;
+
+    std::unordered_map<String, Strings> partition_to_parts;
+    for (const auto & part_name : part_names)
+    {
+        MergeTreePartInfo part_info = MergeTreePartInfo::fromPartName(part_name, version);
+        String partition_id = part_info.partition_id;
+        auto it = partition_to_parts.find(partition_id);
+        if (it != partition_to_parts.end())
         {
-            cached->erase(it->second);
-            /// Force LRU cache update status (weight/evict).
-            part_cache_ptr->set({uuid, it->first}, cached);
+            it->second.emplace_back(part_name);
+        }
+        else
+        {
+            Strings part_list{part_name};
+            partition_to_parts.emplace(partition_id, part_list);
         }
     }
+    invalidPartCache(uuid, meta_ptr, partition_to_parts);
 }
 
 void PartCacheManager::insertDataPartsIntoCache(const IStorage & table, const pb::RepeatedPtrField<Protos::DataModelPart> & parts_model, const bool is_merged_parts, const bool should_update_metrics)
