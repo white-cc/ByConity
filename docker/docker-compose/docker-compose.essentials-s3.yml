@@ -1,0 +1,34 @@
+version: "3"
+services:
+# minio s3 / remote fs
+  minio:
+    image: quay.io/minio/minio
+    restart: always
+    ports:
+      - 19000:9000
+      - 19090:9090
+    volumes:
+      - ${DATA_DIR}/store:/store
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=minio123
+    command: server --console-address ":9090" /store
+    networks:
+      - base_net
+
+# foundation db / catalog
+  fdb-0:
+    image: foundationdb/foundationdb:7.1.24
+    ports:
+      - "4550:4550"
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_COORDINATOR_PORT: 4550
+      FDB_PORT: 4550
+    volumes:
+      - ${DATA_DIR}/fdb:/var/fdb/data/
+    networks:
+      - base_net
+
+networks:
+  base_net:
